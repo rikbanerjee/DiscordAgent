@@ -4,7 +4,7 @@ A Discord bot that uses Google's Gemini Flash 1.5 API to answer questions and re
 
 ## Features
 
-- 🤖 **AI-Powered Responses** - Uses Gemini Flash 1.5 to generate intelligent responses
+- 🤖 **AI-Powered Responses** - Uses Gemini Flash 2.0 Lite to generate intelligent responses
 - 💬 **Natural Conversation** - Responds to all messages in channels the bot can access
 - ⚡ **Fast Processing** - Shows typing indicator while generating responses
 - 📝 **Long Responses** - Automatically splits responses over 2000 characters
