@@ -317,91 +317,70 @@ PLATFORM_EXTRACTORS = {
 
 
 # ---------------------------------------------------------------------------
-# Reddit JSON fetch (bypasses 503 blocks on HTML)
+# Reddit fetch — tries JSON API then falls back to old.reddit.com HTML
 # ---------------------------------------------------------------------------
-async def _fetch_reddit(url: str) -> dict:
-    """Fetch a Reddit URL via the .json API endpoint.
-    Reddit blocks normal scraping with 503s but the JSON API works without auth."""
-    # Normalize URL: strip trailing slash, remove query params for the JSON call
-    clean = url.split('?')[0].rstrip('/')
-    # Remove .json if someone already appended it
+def _reddit_to_old(url: str) -> str:
+    """Rewrite any reddit URL to old.reddit.com (lighter HTML, fewer blocks)."""
+    return re.sub(r'https?://(www\.)?reddit\.com', 'https://old.reddit.com', url)
+
+
+def _reddit_json_url(url: str) -> str:
+    """Build the .json API URL from a Reddit URL."""
+    clean = re.sub(r'https?://(www\.|old\.)?reddit\.com', 'https://old.reddit.com', url)
+    clean = clean.split('?')[0].rstrip('/')
     if clean.endswith('.json'):
         clean = clean[:-5]
-    json_url = clean + '.json'
+    return clean + '.json'
 
-    reddit_headers = {
-        'User-Agent': 'DiscordLinkAgent/1.0 (research bot)',
-        'Accept': 'application/json',
-    }
 
-    try:
-        async with aiohttp.ClientSession(headers=reddit_headers) as session:
-            async with session.get(json_url, timeout=aiohttp.ClientTimeout(total=30),
-                                   allow_redirects=True, ssl=False) as resp:
-                if resp.status != 200:
-                    return {
-                        'url': url, 'title': '', 'content': f'Reddit API returned HTTP {resp.status}',
-                        'platform': 'reddit', 'metadata': {}, 'error': True,
-                    }
-                data = await resp.json()
-    except asyncio.TimeoutError:
-        return {'url': url, 'title': '', 'content': 'Reddit request timed out',
-                'platform': 'reddit', 'metadata': {}, 'error': True}
-    except Exception as e:
-        return {'url': url, 'title': '', 'content': f'Reddit fetch error: {e}',
-                'platform': 'reddit', 'metadata': {}, 'error': True}
-
-    # Parse the JSON response
+def _parse_reddit_json(data, url: str) -> dict:
+    """Parse Reddit JSON API response into our standard content dict."""
     parts = []
     title = ''
     metadata = {}
 
-    try:
-        # Reddit returns a list: [post_listing, comments_listing]
-        # For subreddit pages it's a single listing
-        listings = data if isinstance(data, list) else [data]
+    listings = data if isinstance(data, list) else [data]
 
-        for listing in listings:
-            if not isinstance(listing, dict) or 'data' not in listing:
-                continue
-            children = listing.get('data', {}).get('children', [])
-            for child in children:
-                kind = child.get('kind', '')
-                cdata = child.get('data', {})
+    for listing in listings:
+        if not isinstance(listing, dict) or 'data' not in listing:
+            continue
+        children = listing.get('data', {}).get('children', [])
+        for child in children:
+            kind = child.get('kind', '')
+            cdata = child.get('data', {})
 
-                if kind == 't3':  # Post
-                    title = cdata.get('title', '')
-                    author = cdata.get('author', '')
-                    subreddit = cdata.get('subreddit_name_prefixed', '')
-                    score = cdata.get('score', 0)
-                    created = cdata.get('created_utc', 0)
+            if kind == 't3':  # Post
+                title = cdata.get('title', '')
+                author = cdata.get('author', '')
+                subreddit = cdata.get('subreddit_name_prefixed', '')
+                score = cdata.get('score', 0)
+                created = cdata.get('created_utc', 0)
 
-                    metadata = {
-                        'author': f"u/{author}",
-                        'date': datetime.fromtimestamp(created, tz=timezone.utc).isoformat() if created else '',
-                        'description': f"{subreddit} | Score: {score}",
-                    }
+                metadata = {
+                    'author': f"u/{author}",
+                    'date': datetime.fromtimestamp(created, tz=timezone.utc).isoformat() if created else '',
+                    'description': f"{subreddit} | Score: {score}",
+                }
 
-                    parts.append(f"POST: {title}")
-                    parts.append(f"Author: u/{author} | {subreddit} | Score: {score}")
-                    selftext = cdata.get('selftext', '')
-                    if selftext:
-                        parts.append(f"\n{selftext}")
-                    post_url = cdata.get('url', '')
-                    if post_url and post_url != url and not post_url.startswith('https://www.reddit.com'):
-                        parts.append(f"\nLinked URL: {post_url}")
+                parts.append(f"POST: {title}")
+                parts.append(f"Author: u/{author} | {subreddit} | Score: {score}")
+                selftext = cdata.get('selftext', '')
+                if selftext:
+                    parts.append(f"\n{selftext}")
+                post_url = cdata.get('url', '')
+                if post_url and post_url != url and 'reddit.com' not in post_url:
+                    parts.append(f"\nLinked URL: {post_url}")
+                parts.append('')
+
+            elif kind == 't1':  # Comment
+                cauthor = cdata.get('author', '[deleted]')
+                cscore = cdata.get('score', 0)
+                cbody = cdata.get('body', '')
+                if cbody and cauthor != 'AutoModerator':
+                    parts.append(f"[u/{cauthor} | {cscore} pts]")
+                    parts.append(cbody)
                     parts.append('')
 
-                elif kind == 't1':  # Comment
-                    cauthor = cdata.get('author', '[deleted]')
-                    cscore = cdata.get('score', 0)
-                    cbody = cdata.get('body', '')
-                    if cbody and cauthor != 'AutoModerator':
-                        parts.append(f"[u/{cauthor} | {cscore} pts]")
-                        parts.append(cbody)
-                        parts.append('')
-
-                    # Also grab top replies (one level deep)
                     replies = cdata.get('replies', '')
                     if isinstance(replies, dict):
                         reply_children = replies.get('data', {}).get('children', [])
@@ -415,25 +394,125 @@ async def _fetch_reddit(url: str) -> dict:
                                 parts.append(f"  {rbody}")
                                 parts.append('')
 
-    except (KeyError, TypeError, IndexError) as e:
-        if not parts:
-            return {'url': url, 'title': '', 'content': f'Failed to parse Reddit JSON: {e}',
-                    'platform': 'reddit', 'metadata': {}, 'error': True}
+    content = '\n'.join(parts)
+    return {'title': title, 'content': content, 'metadata': metadata}
+
+
+def _parse_reddit_html(html: str) -> dict:
+    """Fallback: extract content from old.reddit.com HTML."""
+    soup = BeautifulSoup(html, 'html.parser')
+
+    for tag in soup(['script', 'style', 'nav', 'aside', 'noscript', 'iframe', 'svg']):
+        tag.decompose()
+
+    title = ''
+    if soup.title and soup.title.string:
+        title = soup.title.string.strip()
+
+    parts = []
+
+    # Post title + body
+    post_title = soup.find('a', class_='title')
+    if post_title:
+        parts.append(f"POST: {post_title.get_text(strip=True)}")
+        title = title or post_title.get_text(strip=True)
+
+    usertext = soup.find(class_='usertext-body')
+    if usertext:
+        parts.append(usertext.get_text(separator='\n', strip=True))
+        parts.append('')
+
+    # Comments
+    comments = soup.find_all(class_='comment')
+    for comment in comments[:30]:
+        author_tag = comment.find(class_='author')
+        author = author_tag.get_text(strip=True) if author_tag else '[deleted]'
+        body = comment.find(class_='usertext-body')
+        if body and author != 'AutoModerator':
+            score_tag = comment.find(class_='score')
+            score = score_tag.get('title', '') if score_tag else ''
+            parts.append(f"[u/{author}{f' | {score} pts' if score else ''}]")
+            parts.append(body.get_text(separator='\n', strip=True))
+            parts.append('')
+
+    # Fallback to general extraction if nothing found
+    if not parts:
+        main = soup.find(class_='sitetable') or soup.find(role='main') or soup.find('body')
+        if main:
+            parts.append(main.get_text(separator='\n', strip=True))
+
+    metadata = {}
+    meta_desc = soup.find('meta', attrs={'name': 'description'})
+    if meta_desc and meta_desc.get('content'):
+        metadata['description'] = meta_desc['content'].strip()
 
     content = '\n'.join(parts)
+    content = re.sub(r'\n{3,}', '\n\n', content)
+    return {'title': title, 'content': content, 'metadata': metadata}
 
-    max_chars = 50000
-    if len(content) > max_chars:
-        content = content[:max_chars] + '\n\n[Content truncated...]'
 
-    return {
-        'url': url,
-        'title': title,
-        'content': content,
-        'platform': 'reddit',
-        'metadata': metadata,
-        'error': False,
-    }
+async def _fetch_reddit(url: str) -> dict:
+    """Fetch a Reddit URL. Tries old.reddit.com JSON API first,
+    then falls back to old.reddit.com HTML scraping."""
+
+    # Strategy 1: JSON API via old.reddit.com with browser User-Agent
+    json_url = _reddit_json_url(url)
+    try:
+        async with aiohttp.ClientSession(headers=REQUEST_HEADERS) as session:
+            async with session.get(json_url, timeout=aiohttp.ClientTimeout(total=30),
+                                   allow_redirects=True, ssl=False) as resp:
+                if resp.status == 200:
+                    ct = resp.headers.get('Content-Type', '')
+                    if 'json' in ct:
+                        data = await resp.json()
+                        parsed = _parse_reddit_json(data, url)
+                        if parsed['content'].strip():
+                            content = parsed['content']
+                            if len(content) > 50000:
+                                content = content[:50000] + '\n\n[Content truncated...]'
+                            return {
+                                'url': url, 'title': parsed['title'],
+                                'content': content, 'platform': 'reddit',
+                                'metadata': parsed['metadata'], 'error': False,
+                            }
+    except Exception:
+        pass  # Fall through to HTML
+
+    # Strategy 2: old.reddit.com HTML (lighter pages, fewer JS blocks)
+    old_url = _reddit_to_old(url)
+    try:
+        async with aiohttp.ClientSession(headers=REQUEST_HEADERS) as session:
+            async with session.get(old_url, timeout=aiohttp.ClientTimeout(total=30),
+                                   allow_redirects=True, ssl=False) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+                    parsed = _parse_reddit_html(html)
+                    if parsed['content'].strip():
+                        content = parsed['content']
+                        if len(content) > 50000:
+                            content = content[:50000] + '\n\n[Content truncated...]'
+                        return {
+                            'url': url, 'title': parsed['title'],
+                            'content': content, 'platform': 'reddit',
+                            'metadata': parsed['metadata'], 'error': False,
+                        }
+                    return {
+                        'url': url, 'title': '', 'platform': 'reddit',
+                        'content': 'Fetched Reddit page but could not extract content. The post may be deleted or require login.',
+                        'metadata': {}, 'error': True,
+                    }
+                else:
+                    return {
+                        'url': url, 'title': '', 'platform': 'reddit',
+                        'content': f'Reddit returned HTTP {resp.status}. The post may be private, deleted, or Reddit is blocking requests from this IP.',
+                        'metadata': {}, 'error': True,
+                    }
+    except asyncio.TimeoutError:
+        return {'url': url, 'title': '', 'content': 'Reddit request timed out',
+                'platform': 'reddit', 'metadata': {}, 'error': True}
+    except Exception as e:
+        return {'url': url, 'title': '', 'content': f'Reddit fetch error: {e}',
+                'platform': 'reddit', 'metadata': {}, 'error': True}
 
 
 # ---------------------------------------------------------------------------
