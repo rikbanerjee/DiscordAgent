@@ -36,6 +36,9 @@ env/
 *.swo
 *~
 
+# Agent data (persistent content library)
+agent_data/
+
 # OS
 .DS_Store
 Thumbs.db
