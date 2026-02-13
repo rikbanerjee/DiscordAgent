@@ -317,20 +317,51 @@ PLATFORM_EXTRACTORS = {
 
 
 # ---------------------------------------------------------------------------
-# Reddit fetch — tries JSON API then falls back to old.reddit.com HTML
+# Reddit OAuth API + fallback scraping
 # ---------------------------------------------------------------------------
-def _reddit_to_old(url: str) -> str:
-    """Rewrite any reddit URL to old.reddit.com (lighter HTML, fewer blocks)."""
-    return re.sub(r'https?://(www\.)?reddit\.com', 'https://old.reddit.com', url)
+REDDIT_CLIENT_ID = os.getenv('REDDIT_CLIENT_ID', '')
+REDDIT_CLIENT_SECRET = os.getenv('REDDIT_CLIENT_SECRET', '')
+REDDIT_USER_AGENT = 'DiscordLinkAgent/1.0 (by bot)'
+
+# Cache the OAuth token so we don't re-auth on every request
+_reddit_token: dict = {'access_token': '', 'expires_at': 0.0}
 
 
-def _reddit_json_url(url: str) -> str:
-    """Build the .json API URL from a Reddit URL."""
-    clean = re.sub(r'https?://(www\.|old\.)?reddit\.com', 'https://old.reddit.com', url)
+async def _reddit_get_token() -> str:
+    """Get a Reddit OAuth2 access token using client_credentials grant.
+    See https://github.com/reddit-archive/reddit/wiki/OAuth2#application-only-oauth"""
+    now = time.time()
+    if _reddit_token['access_token'] and now < _reddit_token['expires_at']:
+        return _reddit_token['access_token']
+
+    auth = aiohttp.BasicAuth(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET)
+    headers = {'User-Agent': REDDIT_USER_AGENT}
+    data = {'grant_type': 'client_credentials'}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            'https://www.reddit.com/api/v1/access_token',
+            auth=auth, headers=headers, data=data,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f'Reddit OAuth failed: HTTP {resp.status}')
+            body = await resp.json()
+
+    token = body.get('access_token', '')
+    expires_in = body.get('expires_in', 3600)
+    _reddit_token['access_token'] = token
+    _reddit_token['expires_at'] = now + expires_in - 60  # refresh 60s early
+    return token
+
+
+def _reddit_api_path(url: str) -> str:
+    """Extract the Reddit path (e.g. /r/python/comments/abc123/...) from a URL."""
+    clean = re.sub(r'https?://(www\.|old\.|new\.)?reddit\.com', '', url)
     clean = clean.split('?')[0].rstrip('/')
     if clean.endswith('.json'):
         clean = clean[:-5]
-    return clean + '.json'
+    return clean or '/'
 
 
 def _parse_reddit_json(data, url: str) -> dict:
@@ -398,6 +429,11 @@ def _parse_reddit_json(data, url: str) -> dict:
     return {'title': title, 'content': content, 'metadata': metadata}
 
 
+def _reddit_to_old(url: str) -> str:
+    """Rewrite any reddit URL to old.reddit.com."""
+    return re.sub(r'https?://(www\.)?reddit\.com', 'https://old.reddit.com', url)
+
+
 def _parse_reddit_html(html: str) -> dict:
     """Fallback: extract content from old.reddit.com HTML."""
     soup = BeautifulSoup(html, 'html.parser')
@@ -411,7 +447,6 @@ def _parse_reddit_html(html: str) -> dict:
 
     parts = []
 
-    # Post title + body
     post_title = soup.find('a', class_='title')
     if post_title:
         parts.append(f"POST: {post_title.get_text(strip=True)}")
@@ -422,7 +457,6 @@ def _parse_reddit_html(html: str) -> dict:
         parts.append(usertext.get_text(separator='\n', strip=True))
         parts.append('')
 
-    # Comments
     comments = soup.find_all(class_='comment')
     for comment in comments[:30]:
         author_tag = comment.find(class_='author')
@@ -435,7 +469,6 @@ def _parse_reddit_html(html: str) -> dict:
             parts.append(body.get_text(separator='\n', strip=True))
             parts.append('')
 
-    # Fallback to general extraction if nothing found
     if not parts:
         main = soup.find(class_='sitetable') or soup.find(role='main') or soup.find('body')
         if main:
@@ -451,12 +484,45 @@ def _parse_reddit_html(html: str) -> dict:
     return {'title': title, 'content': content, 'metadata': metadata}
 
 
-async def _fetch_reddit(url: str) -> dict:
-    """Fetch a Reddit URL. Tries old.reddit.com JSON API first,
-    then falls back to old.reddit.com HTML scraping."""
+def _reddit_result(url, title, content, metadata, error=False):
+    if len(content) > 50000:
+        content = content[:50000] + '\n\n[Content truncated...]'
+    return {'url': url, 'title': title, 'content': content,
+            'platform': 'reddit', 'metadata': metadata, 'error': error}
 
-    # Strategy 1: JSON API via old.reddit.com with browser User-Agent
-    json_url = _reddit_json_url(url)
+
+async def _fetch_reddit(url: str) -> dict:
+    """Fetch a Reddit URL. Strategy order:
+    1. Reddit OAuth API (oauth.reddit.com) — if REDDIT_CLIENT_ID is set
+    2. old.reddit.com .json endpoint with browser UA
+    3. old.reddit.com HTML scraping
+    """
+
+    # Strategy 1: Official Reddit OAuth API
+    if REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET:
+        try:
+            token = await _reddit_get_token()
+            api_path = _reddit_api_path(url)
+            api_url = f'https://oauth.reddit.com{api_path}'
+            headers = {
+                'Authorization': f'Bearer {token}',
+                'User-Agent': REDDIT_USER_AGENT,
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.get(api_url, headers=headers,
+                                       timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        parsed = _parse_reddit_json(data, url)
+                        if parsed['content'].strip():
+                            return _reddit_result(url, parsed['title'],
+                                                  parsed['content'], parsed['metadata'])
+        except Exception:
+            pass  # Fall through to unauthenticated methods
+
+    # Strategy 2: old.reddit.com .json with browser UA
+    json_path = _reddit_api_path(url)
+    json_url = f'https://old.reddit.com{json_path}.json'
     try:
         async with aiohttp.ClientSession(headers=REQUEST_HEADERS) as session:
             async with session.get(json_url, timeout=aiohttp.ClientTimeout(total=30),
@@ -467,18 +533,12 @@ async def _fetch_reddit(url: str) -> dict:
                         data = await resp.json()
                         parsed = _parse_reddit_json(data, url)
                         if parsed['content'].strip():
-                            content = parsed['content']
-                            if len(content) > 50000:
-                                content = content[:50000] + '\n\n[Content truncated...]'
-                            return {
-                                'url': url, 'title': parsed['title'],
-                                'content': content, 'platform': 'reddit',
-                                'metadata': parsed['metadata'], 'error': False,
-                            }
+                            return _reddit_result(url, parsed['title'],
+                                                  parsed['content'], parsed['metadata'])
     except Exception:
         pass  # Fall through to HTML
 
-    # Strategy 2: old.reddit.com HTML (lighter pages, fewer JS blocks)
+    # Strategy 3: old.reddit.com HTML scraping
     old_url = _reddit_to_old(url)
     try:
         async with aiohttp.ClientSession(headers=REQUEST_HEADERS) as session:
@@ -488,31 +548,20 @@ async def _fetch_reddit(url: str) -> dict:
                     html = await resp.text()
                     parsed = _parse_reddit_html(html)
                     if parsed['content'].strip():
-                        content = parsed['content']
-                        if len(content) > 50000:
-                            content = content[:50000] + '\n\n[Content truncated...]'
-                        return {
-                            'url': url, 'title': parsed['title'],
-                            'content': content, 'platform': 'reddit',
-                            'metadata': parsed['metadata'], 'error': False,
-                        }
-                    return {
-                        'url': url, 'title': '', 'platform': 'reddit',
-                        'content': 'Fetched Reddit page but could not extract content. The post may be deleted or require login.',
-                        'metadata': {}, 'error': True,
-                    }
+                        return _reddit_result(url, parsed['title'],
+                                              parsed['content'], parsed['metadata'])
+                    return _reddit_result(
+                        url, '', 'Fetched Reddit page but could not extract content. '
+                        'The post may be deleted or require login.', {}, error=True)
                 else:
-                    return {
-                        'url': url, 'title': '', 'platform': 'reddit',
-                        'content': f'Reddit returned HTTP {resp.status}. The post may be private, deleted, or Reddit is blocking requests from this IP.',
-                        'metadata': {}, 'error': True,
-                    }
+                    return _reddit_result(
+                        url, '', f'Reddit returned HTTP {resp.status}. '
+                        'The post may be private, deleted, or Reddit is blocking requests.',
+                        {}, error=True)
     except asyncio.TimeoutError:
-        return {'url': url, 'title': '', 'content': 'Reddit request timed out',
-                'platform': 'reddit', 'metadata': {}, 'error': True}
+        return _reddit_result(url, '', 'Reddit request timed out', {}, error=True)
     except Exception as e:
-        return {'url': url, 'title': '', 'content': f'Reddit fetch error: {e}',
-                'platform': 'reddit', 'metadata': {}, 'error': True}
+        return _reddit_result(url, '', f'Reddit fetch error: {e}', {}, error=True)
 
 
 # ---------------------------------------------------------------------------
