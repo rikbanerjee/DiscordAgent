@@ -10,7 +10,7 @@ load_dotenv()
 genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
 
 # Initialize Gemini model (2.0 Flash-Lite - optimized for cost efficiency and low latency)
-model = genai.GenerativeModel('gemini-2.0-flash-lite')
+model = genai.GenerativeModel('gemini-3-flash-preview')
 
 intents = discord.Intents.default()
 intents.message_content = True

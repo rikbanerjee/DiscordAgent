@@ -40,3 +40,12 @@ env/
 .DS_Store
 Thumbs.db
 
+# Logs
+*.log
+logs/
+/var/log/
+
+# Temporary files
+*.tmp
+temp/
+
