@@ -45,6 +45,10 @@ Thumbs.db
 logs/
 /var/log/
 
+# Node.js
+node_modules/
+web-summary-agent/chrome/
+
 # Temporary files
 *.tmp
 temp/
